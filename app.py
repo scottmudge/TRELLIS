@@ -2,6 +2,14 @@ import gradio as gr
 from gradio_litmodel3d import LitModel3D
 
 import os
+import sys
+import traceback
+# import bpy    
+import pymeshlab
+import pymeshlab.pmeshlab
+        
+CurPath = os.path.dirname(os.path.realpath(__file__))
+
 from typing import *
 import torch
 import numpy as np
@@ -13,11 +21,10 @@ from trellis.pipelines import TrellisImageTo3DPipeline
 from trellis.representations import Gaussian, MeshExtractResult
 from trellis.utils import render_utils, postprocessing_utils
 
-
 MAX_SEED = np.iinfo(np.int32).max
-TMP_DIR = "/tmp/Trellis-demo"
+OUTPUT_DIR = f"{CurPath}/output"
 
-os.makedirs(TMP_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def preprocess_image(image: Image.Image) -> Tuple[str, Image.Image]:
@@ -32,8 +39,11 @@ def preprocess_image(image: Image.Image) -> Tuple[str, Image.Image]:
         Image.Image: The preprocessed image.
     """
     trial_id = str(uuid.uuid4())
+    image_path_root = f"{OUTPUT_DIR}/{trial_id}"
+    os.makedirs(image_path_root, exist_ok=True)
+    image_path = f"{image_path_root}/input.png"
     processed_image = pipeline.preprocess_image(image)
-    processed_image.save(f"{TMP_DIR}/{trial_id}.png")
+    processed_image.save(image_path)
     return trial_id, processed_image
 
 
@@ -97,8 +107,11 @@ def image_to_3d(trial_id: str, seed: int, randomize_seed: bool, ss_guidance_stre
     """
     if randomize_seed:
         seed = np.random.randint(0, MAX_SEED)
+    image_path_root = f"{OUTPUT_DIR}/{trial_id}"
+    os.makedirs(image_path_root, exist_ok=True)
+    image_path = f"{image_path_root}/input.png"
     outputs = pipeline.run(
-        Image.open(f"{TMP_DIR}/{trial_id}.png"),
+        Image.open(image_path),
         seed=seed,
         formats=["gaussian", "mesh"],
         preprocess_image=False,
@@ -114,14 +127,69 @@ def image_to_3d(trial_id: str, seed: int, randomize_seed: bool, ss_guidance_stre
     video = render_utils.render_video(outputs['gaussian'][0], num_frames=120)['color']
     video_geo = render_utils.render_video(outputs['mesh'][0], num_frames=120)['normal']
     video = [np.concatenate([video[i], video_geo[i]], axis=1) for i in range(len(video))]
-    trial_id = uuid.uuid4()
-    video_path = f"{TMP_DIR}/{trial_id}.mp4"
+    video_path = f"{image_path_root}/generated.mp4"
     imageio.mimsave(video_path, video, fps=15)
     state = pack_state(outputs['gaussian'][0], outputs['mesh'][0], trial_id)
     return state, video_path
 
+def update_mtl_texture_filename(input_file, output_file, extension):
+    """
+    Update the map_Kd line in an MTL file by adding an extension to the existing filename.
+    
+    :param input_file: Path to the input MTL file
+    :param output_file: Path to save the updated MTL file
+    :param extension: File extension to add (e.g., 'png')
+    """
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(f"Input MTL file not found: {input_file}")
+    
+    with open(input_file, 'r') as f:
+        lines = f.readlines()
+    
+    updated_lines = []
+    for line in lines:
+        if line.startswith('map_Kd '):
+            # Split the line, modify the filename, add extension
+            parts = line.split()
+            filename = parts[1]
+            # Remove any existing extension if present
+            filename_base = filename.split('.')[0]
+            updated_line = f"map_Kd {filename_base}.{extension}\n"
+            updated_lines.append(updated_line)
+        else:
+            updated_lines.append(line)
+    
+    with open(output_file, 'w') as f:
+        f.writelines(updated_lines)
+        
+def update_obj_with_new_mtl_name(input_file, output_file, in_mtl_name, out_mtl_name):
+    """
+    Update the map_Kd line in an MTL file by adding an extension to the existing filename.
+    
+    :param input_file: Path to the input MTL file
+    :param output_file: Path to save the updated MTL file
+    :param extension: File extension to add (e.g., 'png')
+    """
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(f"Input OBJ file not found: {input_file}")
+    
+    with open(input_file, 'r') as f:
+        lines = f.readlines()
+    
+    updated_lines = []
+    for line in lines:
+        if line.startswith('mtllib'):
+            if in_mtl_name in line:
+                line = line.replace(in_mtl_name, out_mtl_name)
+            updated_lines.append(line)
+        else:
+            updated_lines.append(line)
+    
+    with open(output_file, 'w') as f:
+        f.writelines(updated_lines)
 
-def extract_glb(state: dict, mesh_simplify: float, texture_size: int) -> Tuple[str, str]:
+
+def extract_glb(state: dict, mesh_simplify: float, texture_size: int, enable_post_processing: bool) -> Tuple[str, str]:
     """
     Extract a GLB file from the 3D model.
 
@@ -135,9 +203,57 @@ def extract_glb(state: dict, mesh_simplify: float, texture_size: int) -> Tuple[s
     """
     gs, mesh, trial_id = unpack_state(state)
     glb = postprocessing_utils.to_glb(gs, mesh, simplify=mesh_simplify, texture_size=texture_size, verbose=False)
-    glb_path = f"{TMP_DIR}/{trial_id}.glb"
-    glb.export(glb_path)
-    return glb_path, glb_path
+    # glb_path = f"{OUTPUT_DIR}/{trial_id}.glb"
+    glb_path_root = os.path.realpath(f"{OUTPUT_DIR}/{trial_id}")
+    os.makedirs(glb_path_root, exist_ok=True)
+    initial_glb_path = os.path.realpath(f"{glb_path_root}/mesh.glb")
+    glb.export(initial_glb_path)
+    
+    # Extra post-processing logic
+    if enable_post_processing:
+        print("Applying extra post-processing...")
+        
+        # Use PyMeshLab to load and process the GLB
+        ms = pymeshlab.MeshSet()
+        ms.load_new_mesh(initial_glb_path)
+        
+        texture_path = f"{glb_path_root}/texture_0.png"
+        
+        ms.meshing_merge_close_vertices(threshold = pymeshlab.PercentageValue(1.0))
+        ms.meshing_remove_connected_component_by_diameter(mincomponentdiag = pymeshlab.PercentageValue(10.000000))
+        ms.current_mesh().texture(0).save(texture_path)
+        
+        # Save the processed mesh as a new GLB
+        processed_glb_path = os.path.realpath(f"{glb_path_root}/mesh.obj")
+        in_material_file = f"{glb_path_root}/mesh.obj.mtl"
+        if os.path.exists(processed_glb_path):
+            os.unlink(processed_glb_path)
+        if os.path.exists(in_material_file):
+            os.unlink(in_material_file)
+        try:
+            ms.save_current_mesh(processed_glb_path, save_vertex_color=False, save_vertex_coord=True, save_vertex_normal=True, save_face_color=False, save_textures=True)
+        except pymeshlab.pmeshlab.PyMeshLabException as e:
+            # Hacky workaround for issue on Windows
+            e_str = str(e)
+            if "Image" in e_str and "cannot be saved" in e_str:
+                pass
+            else:
+                raise
+        
+        material_file = f"{glb_path_root}/mesh.mtl"
+        # rename
+        os.rename(in_material_file, material_file)
+        update_mtl_texture_filename(material_file, material_file, 'png')
+        update_obj_with_new_mtl_name(processed_glb_path, processed_glb_path, 'mesh.obj.mtl', 'mesh.mtl')
+        
+        print(f"Done post-processing. OBJ saved to {processed_glb_path}")
+        return processed_glb_path, processed_glb_path
+    
+    print(f"No post-processing applied. GLB saved to {initial_glb_path}")
+    return initial_glb_path, initial_glb_path
+
+def postprocess_glb(state: dict):
+    print(state)
 
 
 def activate_button() -> gr.Button:
@@ -148,7 +264,7 @@ def deactivate_button() -> gr.Button:
     return gr.Button(interactive=False)
 
 
-with gr.Blocks() as demo:
+with gr.Blocks(title="TRELLIS (modified)") as demo:
     gr.Markdown("""
     ## Image to 3D Asset with [TRELLIS](https://trellis3d.github.io/)
     * Upload an image and click "Generate" to create a 3D asset. If the image has alpha channel, it be used as the mask. Otherwise, we use `rembg` to remove the background.
@@ -159,23 +275,24 @@ with gr.Blocks() as demo:
         with gr.Column():
             image_prompt = gr.Image(label="Image Prompt", image_mode="RGBA", type="pil", height=300)
             
-            with gr.Accordion(label="Generation Settings", open=False):
+            with gr.Accordion(label="Generation Settings", open=True):
                 seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
                 randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
                 gr.Markdown("Stage 1: Sparse Structure Generation")
                 with gr.Row():
                     ss_guidance_strength = gr.Slider(0.0, 10.0, label="Guidance Strength", value=7.5, step=0.1)
-                    ss_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
+                    ss_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=18, step=1)
                 gr.Markdown("Stage 2: Structured Latent Generation")
                 with gr.Row():
                     slat_guidance_strength = gr.Slider(0.0, 10.0, label="Guidance Strength", value=3.0, step=0.1)
-                    slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
+                    slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=18, step=1)
 
             generate_btn = gr.Button("Generate")
             
-            with gr.Accordion(label="GLB Extraction Settings", open=False):
-                mesh_simplify = gr.Slider(0.9, 0.98, label="Simplify", value=0.95, step=0.01)
-                texture_size = gr.Slider(512, 2048, label="Texture Size", value=1024, step=512)
+            with gr.Accordion(label="GLB Extraction Settings", open=True):
+                mesh_simplify = gr.Slider(0.1, 0.98, label="Simplify", value=0.8, step=0.01)
+                texture_size = gr.Slider(512, 4096, label="Texture Size", value=2048, step=512)
+                enable_post_processing = gr.Checkbox(label="Enable Extra Post-processing and OBJ Export", value=True)
             
             extract_glb_btn = gr.Button("Extract GLB", interactive=False)
 
@@ -228,7 +345,7 @@ with gr.Blocks() as demo:
 
     extract_glb_btn.click(
         extract_glb,
-        inputs=[output_buf, mesh_simplify, texture_size],
+        inputs=[output_buf, mesh_simplify, texture_size, enable_post_processing],
         outputs=[model_output, download_glb],
     ).then(
         activate_button,
